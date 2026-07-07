@@ -1,0 +1,21 @@
+{
+  "name": "growroll",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "GrowRoll - online multiplayer katamari-style rolling game",
+  "scripts": {
+    "dev": "concurrently -n server,client -c blue,green \"pnpm --filter @growroll/server dev\" \"pnpm --filter @growroll/client dev\"",
+    "dev:client": "pnpm --filter @growroll/client dev",
+    "dev:server": "pnpm --filter @growroll/server dev",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "typescript": "^5.7.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

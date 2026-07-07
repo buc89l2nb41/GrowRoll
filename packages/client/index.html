@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GrowRoll</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      html,
+      body,
+      #app {
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: #0b1020;
+        font-family: system-ui, sans-serif;
+      }
+      canvas {
+        display: block;
+      }
+      #hud {
+        position: fixed;
+        top: 16px;
+        left: 16px;
+        color: #e6edf3;
+        font-size: 14px;
+        line-height: 1.5;
+        text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
+        pointer-events: none;
+      }
+      #hud .title {
+        font-size: 20px;
+        font-weight: 700;
+        letter-spacing: 0.5px;
+      }
+      #hud .size {
+        color: #7ee787;
+        font-variant-numeric: tabular-nums;
+      }
+      #hud .next {
+        color: #f2cc60;
+        font-size: 13px;
+      }
+      #hud .net {
+        color: #58a6ff;
+        font-size: 12px;
+        margin-top: 4px;
+      }
+      #hint {
+        position: fixed;
+        bottom: 16px;
+        left: 16px;
+        color: #8b949e;
+        font-size: 13px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <div id="hud">
+      <div class="title">GrowRoll</div>
+      <div>크기: <span class="size" id="size">0.00</span> m</div>
+      <div>붙임: <span id="count">0</span>개</div>
+      <div class="next" id="next">다음: 노랑 (1.33m)</div>
+      <div class="net" id="net">오프라인 (싱글)</div>
+    </div>
+    <div id="hint">이동: WASD / 방향키 · 카메라: 마우스 드래그</div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
