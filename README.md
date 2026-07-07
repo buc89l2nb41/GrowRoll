@@ -51,6 +51,19 @@ pnpm dev
 | `pnpm build` | 전체 빌드 |
 | `pnpm typecheck` | 전체 타입체크 |
 
+## Vercel 배포 (클라이언트)
+Vercel 프로젝트 설정:
+- **Root Directory**: `packages/client`
+- **Framework Preset**: Other (또는 Vite — `packages/client/vercel.json`이 우선)
+- **Output Directory**: `dist` (기본값, 비워도 됨)
+
+`@growroll/shared` 워크스페이스 의존성 때문에 install/build는 모노레포 루트에서 실행합니다 (`packages/client/vercel.json` 참고).
+
+멀티플레이 연결 시 Vercel 환경변수:
+```
+VITE_SERVER_URL=wss://<Oracle-서버-주소>
+```
+
 ## 패키지 구조
 ```
 packages/
