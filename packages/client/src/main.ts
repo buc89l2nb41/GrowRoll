@@ -2,72 +2,123 @@ import * as THREE from "three";
 import RAPIER from "@dimforge/rapier3d-compat";
 import {
   START_RADIUS,
+  VISUAL_CORE_RADIUS,
   FIXED_DT,
   ANGULAR_DAMPING,
   LINEAR_DAMPING,
   GROUND_FRICTION,
   KATAMARI_MASS,
   ATTACH_SINK_RATIO,
+  CAMERA_FOV,
+  CAMERA_BALL_SCREEN_FRACTION,
+  CAMERA_HEIGHT_RATIO,
+  CAMERA_RADIUS_SMOOTH_SPEED,
+  CAMERA_RADIUS_MAX_GROW_PER_SEC,
+  CAMERA_RADIUS_GROWTH_BLEND,
+  CAMERA_MAX_FRAME_RADIUS,
+  cameraFollowOffset,
+  cameraFramingRadius,
+  smoothCameraFramingRadius,
+  MAP_PICKUP_BUDGET,
+  MAP_GROUND_SIZE,
+  MAP_PLAY_MARGIN,
+  MAP_RECOVER_MIN_Y,
+  MAP_RECOVER_MAX_Y,
+  STREAM_CHUNK_SIZE,
+  STREAM_PHYSICS_RADIUS,
+  STREAM_VISUAL_RADIUS,
+  STREAM_VISUAL_RELEASE_RADIUS,
+  STREAM_FADE_IN_SPEED,
+  TILE_FLOOR_ENABLED,
+  GROUND_TEXTURE_ENABLED,
+  ATTACH_PHYSICS_COUNT,
+  WORLD_GRAVITY,
+  GROUND_COLLIDER_HALF_HEIGHT,
+  PHYSICS_SUBSTEPS,
+  PHYSICS_MAX_CCD_SUBSTEPS,
+  SOFT_CCD_RADIUS_FACTOR,
+  GROUND_PROBE_MARGIN,
+  AIR_CONTROL,
+  MOVE_SPEED,
+  computeMoveDir,
   computeMoveVelocity,
   computeRollAngvel,
-  surfaceAttachPosition,
-  growKatamariRadius,
+  tieredSurfaceAttachPosition,
+  radialOutwardNormal,
   canPickup,
-  nextLockedTier,
-  minDiameterForPickup,
-  OBJECT_TIERS,
+  growPickupRadius,
+  modelingClumpRadius,
+  computePickupSensorRadius,
+  physicsColliderRadius,
+  growthHudText,
+  PROP_IDS,
   mulberry32,
   seededUnitVector,
   WORLD_SEED,
+  getPropDef,
+  worldColliderHalf,
+  generateGardenLayout,
+  type PropId,
 } from "@growroll/shared";
 import { Input } from "./input.js";
 import { Net } from "./net.js";
+import { PHYS_GROUPS } from "./collisionGroups.js";
+import { logPropDrawables, resolvePropDrawables } from "./objectDrawables.js";
+import { createGroundMaterial } from "./groundMaterial.js";
 
 /**
  * Phase 1 LOCAL prototype (optimized): Three.js + Rapier katamari.
  *
  * Performance strategy (see docs/DESIGN.md §7):
- *  - Map + attached objects rendered with InstancedMesh (per tier) => few draw calls.
+ *  - Map + attached objects rendered with InstancedMesh (per propId) => few draw calls.
  *  - Free objects are STATIC colliders (no rigid body, no per-tick sync).
- *  - Collision events only on the katamari sphere + a capped set of attach sensors.
+ *  - Collision events on the katamari sphere + clump pickup sensor (overlap).
  *  - The rolling sphere collider is rebuilt only when the radius grows >2%.
  */
 async function main() {
   await RAPIER.init();
+
+  const debugCollidersEnabled = import.meta.env.VITE_DEBUG_COLLIDERS === "true";
 
   const app = document.getElementById("app")!;
   const sizeLabel = document.getElementById("size")!;
   const countLabel = document.getElementById("count")!;
   const nextLabel = document.getElementById("next")!;
 
-  // --- renderer / scene ----------------------------------------------------
   const renderer = new THREE.WebGLRenderer({ antialias: true });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.18;
   renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   app.appendChild(renderer.domElement);
 
+  const skyColor = new THREE.Color(0x9ecfff);
   const scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x0b1020);
-  scene.fog = new THREE.Fog(0x0b1020, 40, 120);
+  scene.background = skyColor.clone();
 
   const camera = new THREE.PerspectiveCamera(
-    60,
+    CAMERA_FOV,
     window.innerWidth / window.innerHeight,
     0.1,
     500,
   );
 
-  const hemi = new THREE.HemisphereLight(0xbad7ff, 0x202840, 0.9);
+  const hemi = new THREE.HemisphereLight(0xf4f8ff, 0x8fb878, 1.45);
   scene.add(hemi);
-  const sun = new THREE.DirectionalLight(0xffffff, 1.4);
-  sun.position.set(20, 40, 20);
+  const ambient = new THREE.AmbientLight(0xfff6e8, 0.62);
+  scene.add(ambient);
+  const sun = new THREE.DirectionalLight(0xfff9ef, 2.1);
+  sun.position.set(28, 52, 22);
   sun.castShadow = true;
-  // Smaller shadow map + tight frustum that follows the player = crisp + cheap.
-  sun.shadow.mapSize.set(1024, 1024);
+  sun.shadow.mapSize.set(2048, 2048);
+  sun.shadow.bias = -0.0002;
+  sun.shadow.normalBias = 0.02;
   sun.shadow.camera.near = 1;
-  sun.shadow.camera.far = 120;
-  const shadowExtent = 24;
+  sun.shadow.camera.far = 160;
+  const shadowExtent = 36;
   sun.shadow.camera.left = -shadowExtent;
   sun.shadow.camera.right = shadowExtent;
   sun.shadow.camera.top = shadowExtent;
@@ -75,32 +126,91 @@ async function main() {
   scene.add(sun);
   scene.add(sun.target);
 
-  // --- physics world -------------------------------------------------------
-  const world = new RAPIER.World({ x: 0, y: -20, z: 0 });
+  const fill = new THREE.DirectionalLight(0xc8ddff, 0.55);
+  fill.position.set(-24, 28, -18);
+  scene.add(fill);
 
-  // ground
-  const groundSize = 240;
-  const groundMesh = new THREE.Mesh(
-    new THREE.PlaneGeometry(groundSize, groundSize),
-    new THREE.MeshStandardMaterial({ color: 0x1b2a4a, roughness: 1 }),
-  );
+  let colliderDebug: import("./debugColliders.js").ColliderDebug | null = null;
+  if (debugCollidersEnabled) {
+    const { ColliderDebug } = await import("./debugColliders.js");
+    colliderDebug = new ColliderDebug(scene);
+    console.info("[debug] collider wireframes enabled (VITE_DEBUG_COLLIDERS)");
+  }
+
+  const world = new RAPIER.World({ x: 0, y: WORLD_GRAVITY, z: 0 });
+  world.integrationParameters.maxCcdSubsteps = PHYSICS_MAX_CCD_SUBSTEPS;
+
+  const groundSize = MAP_GROUND_SIZE;
+  const groundHalfY = GROUND_COLLIDER_HALF_HEIGHT;
+
+  const rng = mulberry32(WORLD_SEED);
+  const layout = generateGardenLayout(rng, groundSize, MAP_PICKUP_BUDGET);
+
+  const groundMaterial = GROUND_TEXTURE_ENABLED
+    ? await createGroundMaterial(groundSize, layout.groundZones)
+    : new THREE.MeshStandardMaterial({
+        color: 0x5a9c52,
+        roughness: 0.88,
+        metalness: 0,
+      });
+
+  const groundMesh = new THREE.Mesh(new THREE.PlaneGeometry(groundSize, groundSize), groundMaterial);
   groundMesh.rotation.x = -Math.PI / 2;
   groundMesh.receiveShadow = true;
+  groundMesh.visible = !TILE_FLOOR_ENABLED;
   scene.add(groundMesh);
-  const grid = new THREE.GridHelper(groundSize, 48, 0x33507f, 0x22375c);
-  scene.add(grid);
   world.createCollider(
-    RAPIER.ColliderDesc.cuboid(groundSize / 2, 0.5, groundSize / 2).setTranslation(
-      0,
-      -0.5,
-      0,
-    ),
+    RAPIER.ColliderDesc.cuboid(groundSize / 2, groundHalfY, groundSize / 2)
+      .setTranslation(0, -groundHalfY, 0)
+      .setCollisionGroups(PHYS_GROUPS.world),
   );
+  colliderDebug?.setGround(groundSize / 2, groundHalfY, groundSize / 2);
 
-  // --- katamari (player ball) ---------------------------------------------
-  /** Logical size: grows on every pickup. Drives HUD, pickup gating, camera. */
-  let katamariRadius = START_RADIUS;
-  /** Physical/visual radius: trails katamariRadius, updated in >=2% steps. */
+  const wallHeight = 4;
+  const wallThick = 1;
+  const half = groundSize / 2;
+  const wallMat = new THREE.MeshStandardMaterial({ color: 0x7a5c3a, roughness: 0.88 });
+  const hedgeMat = new THREE.MeshStandardMaterial({ color: 0x4d8a42, roughness: 0.92 });
+  const walls = new THREE.Group();
+  scene.add(walls);
+
+  function addBoundaryWall(
+    px: number,
+    py: number,
+    pz: number,
+    hx: number,
+    hy: number,
+    hz: number,
+  ): void {
+    world.createCollider(
+      RAPIER.ColliderDesc.cuboid(hx, hy, hz)
+        .setTranslation(px, py, pz)
+        .setCollisionGroups(PHYS_GROUPS.world),
+    );
+    const fence = new THREE.Mesh(
+      new THREE.BoxGeometry(hx * 2, hy * 2, hz * 2),
+      wallMat,
+    );
+    fence.position.set(px, py, pz);
+    fence.castShadow = true;
+    fence.receiveShadow = true;
+    walls.add(fence);
+    const hedgeH = 1.2;
+    const hedge = new THREE.Mesh(
+      new THREE.BoxGeometry(hx * 2, hedgeH, hz * 2),
+      hedgeMat,
+    );
+    hedge.position.set(px, py + hy + hedgeH / 2 - 0.05, pz);
+    hedge.castShadow = true;
+    walls.add(hedge);
+  }
+
+  addBoundaryWall(half + wallThick / 2, wallHeight / 2, 0, wallThick / 2, wallHeight / 2, half);
+  addBoundaryWall(-half - wallThick / 2, wallHeight / 2, 0, wallThick / 2, wallHeight / 2, half);
+  addBoundaryWall(0, wallHeight / 2, half + wallThick / 2, half, wallHeight / 2, wallThick / 2);
+  addBoundaryWall(0, wallHeight / 2, -half - wallThick / 2, half, wallHeight / 2, wallThick / 2);
+
+  /** Rolling physics sphere — grows slowly with the visible clump. */
   let colliderRadius = START_RADIUS;
 
   const ballRoot = new THREE.Object3D();
@@ -115,26 +225,48 @@ async function main() {
   });
   const ballMesh = new THREE.Mesh(new THREE.SphereGeometry(1, 32, 24), ballMat);
   ballMesh.castShadow = true;
-  ballMesh.scale.setScalar(colliderRadius);
+  ballMesh.scale.setScalar(VISUAL_CORE_RADIUS);
   ballRoot.add(ballMesh);
 
   const ballBody = world.createRigidBody(
     RAPIER.RigidBodyDesc.dynamic()
       .setTranslation(0, colliderRadius, 0)
       .setAngularDamping(ANGULAR_DAMPING)
-      .setLinearDamping(LINEAR_DAMPING),
+      .setLinearDamping(LINEAR_DAMPING)
+      .setCcdEnabled(true)
+      .setSoftCcdPrediction(colliderRadius * SOFT_CCD_RADIUS_FACTOR),
   );
   function makeKatamariCollider(r: number): RAPIER.Collider {
     return world.createCollider(
       RAPIER.ColliderDesc.ball(r)
         .setMass(KATAMARI_MASS)
         .setFriction(GROUND_FRICTION)
-        .setRestitution(0.08)
+        .setRestitution(0.02)
+        .setCollisionGroups(PHYS_GROUPS.katamari)
         .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS),
       ballBody,
     );
   }
   let ballCollider = makeKatamariCollider(colliderRadius);
+
+  let respawnX = 0;
+  let respawnZ = 0;
+
+  /** Solid colliders for the newest attachments (rotate with the ball). */
+  const attachColliders: RAPIER.Collider[] = [];
+
+  /** Pickup-only sensor — matches visible clump so props touching attachments still stick. */
+  let activePickupSensorRadius = VISUAL_CORE_RADIUS;
+  function makePickupSensor(r: number): RAPIER.Collider {
+    return world.createCollider(
+      RAPIER.ColliderDesc.ball(r)
+        .setSensor(true)
+        .setCollisionGroups(PHYS_GROUPS.pickupSensor)
+        .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS),
+      ballBody,
+    );
+  }
+  let pickupSensor = makePickupSensor(activePickupSensorRadius);
 
   const eventQueue = new RAPIER.EventQueue(true);
   const ballQuat = new THREE.Quaternion();
@@ -144,205 +276,302 @@ async function main() {
   const toObject = new THREE.Vector3();
   const up = new THREE.Vector3(0, 1, 0);
 
-  // scratch objects reused for matrix composition (avoid per-frame allocs)
   const mat4 = new THREE.Matrix4();
   const scratchPos = new THREE.Vector3();
   const scratchScale = new THREE.Vector3();
   const scratchQuat = new THREE.Quaternion();
   const HIDDEN = new THREE.Matrix4().makeScale(0, 0, 0);
 
-  // --- instanced object pools + chunk streaming ---------------------------
-  // Tier 3: the map can hold thousands of objects, but only objects in chunks
-  // near the player get a physics collider + visible instance. This bounds the
-  // active collider count regardless of total map size.
-  const NUM_OBJECTS = 1500;
-  const CHUNK_SIZE = 20; // meters per chunk cell
-  const ACTIVE_RADIUS = 2; // Chebyshev radius of active cells (5x5 = 25 cells)
-  const boxGeo = new THREE.BoxGeometry(1, 1, 1);
+  const CHUNK_SIZE = STREAM_CHUNK_SIZE;
 
   interface FreeObj {
-    id: number; // stable index into freeObjs (shared across clients)
-    tier: number;
-    index: number; // instance slot in freeMesh[tier]
+    id: number;
+    propId: PropId;
+    index: number;
+    /** Per-instance visual + collider scale. */
     size: number;
+    /** Spawn modeling tier — used for core vs layered attach. */
+    tierIndex: number;
     px: number;
     py: number;
     pz: number;
-    collider: RAPIER.Collider | null; // only set while active
+    rotY: number;
+    collider: RAPIER.Collider | null;
+    colliderHalf: [number, number, number];
     picked: boolean;
-    active: boolean;
+    visual: boolean;
+    physics: boolean;
+    /** 0 = hidden, 1 = full scale (fade-in on spawn). */
+    fade: number;
+    /** Cached pickable vs blocking collision filter. */
+    pickableFilter?: boolean;
   }
 
   const cellKey = (cx: number, cz: number) => `${cx},${cz}`;
   const cellIndex = (v: number) => Math.floor((v + groundSize / 2) / CHUNK_SIZE);
 
-  // Decide tiers/positions up-front so we can size instanced meshes exactly.
-  // Seeded RNG => every client generates the identical map layout.
-  const rng = mulberry32(WORLD_SEED);
-  const perTier = OBJECT_TIERS.map(() => 0);
+  const drawables = await resolvePropDrawables();
+  logPropDrawables(drawables);
+
+  const perPropCount = Object.fromEntries(PROP_IDS.map((id) => [id, 0])) as Record<
+    PropId,
+    number
+  >;
+  for (const p of layout.pickups) perPropCount[p.propId]++;
+
+  const perPropIdx = Object.fromEntries(PROP_IDS.map((id) => [id, 0])) as Record<
+    PropId,
+    number
+  >;
   const freeObjs: FreeObj[] = [];
   const chunks = new Map<string, FreeObj[]>();
-  for (let i = 0; i < NUM_OBJECTS; i++) {
-    const tier = Math.floor(rng() * OBJECT_TIERS.length);
-    const size = OBJECT_TIERS[tier].size;
-    const px = (rng() - 0.5) * (groundSize - 6);
-    const pz = (rng() - 0.5) * (groundSize - 6);
+  for (let i = 0; i < layout.pickups.length; i++) {
+    const p = layout.pickups[i]!;
+    const def = getPropDef(p.propId);
     const obj: FreeObj = {
       id: i,
-      tier,
-      index: perTier[tier]++,
-      size,
-      px,
-      py: size / 2,
-      pz,
+      propId: p.propId,
+      index: perPropIdx[p.propId]++,
+      size: p.size,
+      tierIndex: p.tierIndex,
+      px: p.px,
+      py: p.size / 2,
+      pz: p.pz,
+      rotY: p.rotY,
       collider: null,
+      colliderHalf: worldColliderHalf(def.colliderHalf, p.size),
       picked: false,
-      active: false,
+      visual: false,
+      physics: false,
+      fade: 0,
     };
     freeObjs.push(obj);
-    const key = cellKey(cellIndex(px), cellIndex(pz));
+    const key = cellKey(cellIndex(p.px), cellIndex(p.pz));
     (chunks.get(key) ?? chunks.set(key, []).get(key)!).push(obj);
   }
 
-  // Free (world) objects: one InstancedMesh per tier. All start hidden and are
-  // revealed only when their chunk is active.
-  const freeMesh = OBJECT_TIERS.map((t, ti) => {
+  function propGeometry(propId: PropId): THREE.BufferGeometry {
+    const d = drawables[propId];
+    return d.usingGlb ? d.geometry.clone() : d.geometry;
+  }
+
+  function makeInstancedMesh(
+    propId: PropId,
+    count: number,
+    castShadow: boolean,
+  ): THREE.InstancedMesh {
+    const d = drawables[propId];
     const m = new THREE.InstancedMesh(
-      boxGeo,
-      new THREE.MeshStandardMaterial({ color: t.color, roughness: 0.7 }),
-      Math.max(1, perTier[ti]),
+      propGeometry(propId),
+      d.material,
+      Math.max(1, count),
     );
-    m.castShadow = false;
+    m.castShadow = castShadow;
     m.receiveShadow = false;
     m.frustumCulled = false;
     m.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     for (let k = 0; k < m.count; k++) m.setMatrixAt(k, HIDDEN);
     m.instanceMatrix.needsUpdate = true;
-    scene.add(m);
     return m;
-  });
+  }
 
-  // Attached objects: one InstancedMesh per tier, parented to the ball.
-  const attachMesh = OBJECT_TIERS.map((t, ti) => {
-    const m = new THREE.InstancedMesh(
-      boxGeo,
-      new THREE.MeshStandardMaterial({ color: t.color, roughness: 0.7 }),
-      Math.max(1, perTier[ti]),
-    );
-    m.castShadow = true;
-    m.frustumCulled = false;
-    m.count = 0;
-    m.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-    attachments.add(m);
-    return m;
-  });
+  const freeMesh = Object.fromEntries(
+    PROP_IDS.map((id) => {
+      const m = makeInstancedMesh(id, perPropCount[id], false);
+      scene.add(m);
+      return [id, m];
+    }),
+  ) as Record<PropId, THREE.InstancedMesh>;
+
+  const attachMesh = Object.fromEntries(
+    PROP_IDS.map((id) => {
+      const m = makeInstancedMesh(id, perPropCount[id], true);
+      m.count = 0;
+      attachments.add(m);
+      return [id, m];
+    }),
+  ) as Record<PropId, THREE.InstancedMesh>;
+
+  if (GROUND_TEXTURE_ENABLED) {
+    console.info("[ground] texture floor: grass + stone paths + dirt zones (1 draw call)");
+  }
 
   const freeByCollider = new Map<number, FreeObj>();
-  const dirtyFreeTiers = new Set<number>();
+  const dirtyFreeProps = new Set<PropId>();
 
-  function setObjActive(obj: FreeObj, active: boolean): void {
-    if (obj.picked || obj.active === active) return;
-    obj.active = active;
-    if (active) {
-      const half = obj.size / 2;
+  interface Attached {
+    propId: PropId;
+    index: number;
+    size: number;
+    normal: THREE.Vector3;
+    rot: THREE.Quaternion;
+    /** Ball-local position frozen at pickup (rolling sphere surface at attach time). */
+    localPos: THREE.Vector3;
+  }
+  const attachedList: Attached[] = [];
+  let attachedCount = 0;
+  /** Pickup eligibility + tier progression (volume growth — not visual shell). */
+  let pickupGrowthRadius = START_RADIUS;
+
+  function pickupClumpRadius(): number {
+    return modelingClumpRadius(pickupGrowthRadius);
+  }
+
+  function pickupSensorReach(): number {
+    return computePickupSensorRadius(visualClumpRadius(), pickupGrowthRadius);
+  }
+
+  function composePickupMatrix(obj: FreeObj): void {
+    if (!obj.visual || obj.picked || obj.fade <= 0) {
+      freeMesh[obj.propId].setMatrixAt(obj.index, HIDDEN);
+      return;
+    }
+    const s = obj.size * obj.fade;
+    mat4.compose(
+      scratchPos.set(obj.px, obj.py, obj.pz),
+      scratchQuat.setFromAxisAngle(up, obj.rotY),
+      scratchScale.set(s, s, s),
+    );
+    freeMesh[obj.propId].setMatrixAt(obj.index, mat4);
+  }
+
+  function setObjPhysics(obj: FreeObj, on: boolean): void {
+    if (obj.picked || obj.physics === on) return;
+    obj.physics = on;
+    if (on) {
+      const [hx, hy, hz] = obj.colliderHalf;
+      scratchQuat.setFromAxisAngle(up, obj.rotY);
       obj.collider = world.createCollider(
-        RAPIER.ColliderDesc.cuboid(half, half, half)
+        RAPIER.ColliderDesc.cuboid(hx, hy, hz)
           .setTranslation(obj.px, obj.py, obj.pz)
+          .setRotation({ x: scratchQuat.x, y: scratchQuat.y, z: scratchQuat.z, w: scratchQuat.w })
           .setFriction(0.6)
-          .setRestitution(0.05),
-        // no COLLISION_EVENTS — the katamari collider carries the flag
+          .setRestitution(0),
       );
       freeByCollider.set(obj.collider.handle, obj);
-      mat4.compose(
-        scratchPos.set(obj.px, obj.py, obj.pz),
-        scratchQuat.identity(),
-        scratchScale.set(obj.size, obj.size, obj.size),
-      );
-      freeMesh[obj.tier].setMatrixAt(obj.index, mat4);
+      obj.pickableFilter = undefined;
+      syncPropCollisionGroups(obj, true);
+      colliderDebug?.addProp(obj.id, obj.px, obj.py, obj.pz, hx, hy, hz);
     } else {
       if (obj.collider) {
         freeByCollider.delete(obj.collider.handle);
         world.removeCollider(obj.collider, false);
         obj.collider = null;
       }
-      freeMesh[obj.tier].setMatrixAt(obj.index, HIDDEN);
+      colliderDebug?.removeProp(obj.id);
     }
-    dirtyFreeTiers.add(obj.tier);
   }
 
-  let activeCells = new Set<string>();
-  let currentCell = "";
+  function setObjVisual(obj: FreeObj, on: boolean): void {
+    if (obj.picked || obj.visual === on) return;
+    obj.visual = on;
+    if (on) {
+      obj.fade = 0.001;
+      composePickupMatrix(obj);
+    } else {
+      obj.fade = 0;
+      freeMesh[obj.propId].setMatrixAt(obj.index, HIDDEN);
+    }
+    dirtyFreeProps.add(obj.propId);
+  }
+
+  function chunkDistChebyshev(key: string, cx: number, cz: number): number {
+    const comma = key.indexOf(",");
+    const kx = Number(key.slice(0, comma));
+    const kz = Number(key.slice(comma + 1));
+    return Math.max(Math.abs(kx - cx), Math.abs(kz - cz));
+  }
+
+  function collectChunkRing(cx: number, cz: number, radius: number): Set<string> {
+    const out = new Set<string>();
+    for (let dx = -radius; dx <= radius; dx++) {
+      for (let dz = -radius; dz <= radius; dz++) {
+        out.add(cellKey(cx + dx, cz + dz));
+      }
+    }
+    return out;
+  }
+
+  function tickPickupFades(dt: number): void {
+    const dirty = new Set<PropId>();
+    for (const obj of freeObjs) {
+      if (!obj.visual || obj.picked || obj.fade >= 1) continue;
+      obj.fade = Math.min(1, obj.fade + dt * STREAM_FADE_IN_SPEED);
+      composePickupMatrix(obj);
+      dirty.add(obj.propId);
+    }
+    for (const id of dirty) freeMesh[id].instanceMatrix.needsUpdate = true;
+  }
+
+  let activePhysicsCells = new Set<string>();
+  let activeVisualCells = new Set<string>();
+  let streamCellX = NaN;
+  let streamCellZ = NaN;
+
   function updateStreaming(bx: number, bz: number): void {
     const cx = cellIndex(bx);
     const cz = cellIndex(bz);
-    const key = cellKey(cx, cz);
-    if (key === currentCell) return;
-    currentCell = key;
+    if (cx === streamCellX && cz === streamCellZ) return;
+    streamCellX = cx;
+    streamCellZ = cz;
 
-    const wanted = new Set<string>();
-    for (let dx = -ACTIVE_RADIUS; dx <= ACTIVE_RADIUS; dx++) {
-      for (let dz = -ACTIVE_RADIUS; dz <= ACTIVE_RADIUS; dz++) {
-        wanted.add(cellKey(cx + dx, cz + dz));
-      }
-    }
-    for (const k of activeCells) {
-      if (!wanted.has(k)) {
+    const physicsWanted = collectChunkRing(cx, cz, STREAM_PHYSICS_RADIUS);
+    const visualWanted = collectChunkRing(cx, cz, STREAM_VISUAL_RADIUS);
+
+    for (const k of activePhysicsCells) {
+      if (!physicsWanted.has(k)) {
         const list = chunks.get(k);
-        if (list) for (const o of list) setObjActive(o, false);
+        if (list) for (const o of list) setObjPhysics(o, false);
       }
     }
-    for (const k of wanted) {
-      if (!activeCells.has(k)) {
+    for (const k of physicsWanted) {
+      if (!activePhysicsCells.has(k)) {
         const list = chunks.get(k);
-        if (list) for (const o of list) setObjActive(o, true);
+        if (list) for (const o of list) setObjPhysics(o, true);
       }
     }
-    activeCells = wanted;
-    dirtyFreeTiers.forEach((ti) => (freeMesh[ti].instanceMatrix.needsUpdate = true));
-    dirtyFreeTiers.clear();
+    activePhysicsCells = physicsWanted;
+
+    const nextVisual = new Set<string>();
+    for (const k of activeVisualCells) {
+      if (chunkDistChebyshev(k, cx, cz) <= STREAM_VISUAL_RELEASE_RADIUS) nextVisual.add(k);
+    }
+    for (const k of visualWanted) nextVisual.add(k);
+
+    for (const k of activeVisualCells) {
+      if (!nextVisual.has(k)) {
+        const list = chunks.get(k);
+        if (list) for (const o of list) setObjVisual(o, false);
+      }
+    }
+    for (const k of nextVisual) {
+      if (!activeVisualCells.has(k)) {
+        const list = chunks.get(k);
+        if (list) for (const o of list) setObjVisual(o, true);
+      }
+    }
+    activeVisualCells = nextVisual;
+
+    for (const id of dirtyFreeProps) freeMesh[id].instanceMatrix.needsUpdate = true;
+    dirtyFreeProps.clear();
   }
-  updateStreaming(0, 0); // activate chunks around the spawn point
+  updateStreaming(0, 0);
 
-  // --- attached bookkeeping + sensor cap ----------------------------------
-  interface Attached {
-    tier: number;
-    index: number;
-    size: number;
-    normal: THREE.Vector3; // outward normal in ball-local space
-    rot: THREE.Quaternion; // orientation in ball-local space
-    sensor?: RAPIER.Collider;
-  }
-  const attachedList: Attached[] = [];
-  let attachedCount = 0;
-
-  // Only the most recent sensors are kept as real colliders; older attachments
-  // are approximated by the growing sphere. Bounds physics cost as we scale.
-  const MAX_SENSORS = 24;
-  const sensorHandles = new Set<number>();
-  const sensorQueue: Attached[] = [];
-
-  // --- input ---------------------------------------------------------------
   const input = new Input(renderer.domElement);
 
-  // --- networking (Phase 2 relay) -----------------------------------------
-  // A remote player is rendered as a core sphere + a single InstancedMesh that
-  // holds their attached objects (per-instance color = tier). Attachments are
-  // reconstructed from the SHARED deterministic map via broadcast `pickup`
-  // events, so no per-object position data is ever sent over the network.
-  const MAX_REMOTE_ATTACH = 80; // visual cap per remote (ring buffer)
-  const tierColors = OBJECT_TIERS.map((t) => new THREE.Color(t.color));
+  const MAX_REMOTE_ATTACH = 80;
 
   interface RemoteAttach {
-    tier: number;
+    propId: PropId;
     size: number;
     normal: THREE.Vector3;
+    localPos: THREE.Vector3;
   }
   interface Remote {
     group: THREE.Object3D;
     core: THREE.Mesh;
-    attachMesh: THREE.InstancedMesh;
-    attach: (RemoteAttach | undefined)[];
-    attachTotal: number;
+    attachMeshes: Record<PropId, THREE.InstancedMesh>;
+    attachList: RemoteAttach[];
     layoutRadius: number;
     targetPos: THREE.Vector3;
     targetQuat: THREE.Quaternion;
@@ -369,23 +598,20 @@ async function main() {
     core.castShadow = true;
     group.add(core);
 
-    const attachMesh = new THREE.InstancedMesh(
-      boxGeo,
-      new THREE.MeshStandardMaterial({ roughness: 0.7 }),
-      MAX_REMOTE_ATTACH,
-    );
-    attachMesh.castShadow = true;
-    attachMesh.frustumCulled = false;
-    attachMesh.count = 0;
-    attachMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-    group.add(attachMesh);
+    const attachMeshes = Object.fromEntries(
+      PROP_IDS.map((propId) => {
+        const m = makeInstancedMesh(propId, MAX_REMOTE_ATTACH, true);
+        m.count = 0;
+        group.add(m);
+        return [propId, m];
+      }),
+    ) as Record<PropId, THREE.InstancedMesh>;
 
     const r: Remote = {
       group,
       core,
-      attachMesh,
-      attach: new Array(MAX_REMOTE_ATTACH),
-      attachTotal: 0,
+      attachMeshes,
+      attachList: [],
       layoutRadius: 0,
       targetPos: new THREE.Vector3(pos[0], pos[1], pos[2]),
       targetQuat: new THREE.Quaternion(),
@@ -393,6 +619,46 @@ async function main() {
     };
     remotes.set(id, r);
     return r;
+  }
+
+  function layoutRemoteAttach(
+    a: RemoteAttach,
+    meshIndex: number,
+    mesh: THREE.InstancedMesh,
+  ): void {
+    scratchQuat.setFromUnitVectors(up, a.normal);
+    mat4.compose(
+      scratchPos.copy(a.localPos),
+      scratchQuat,
+      scratchScale.set(a.size, a.size, a.size),
+    );
+    mesh.setMatrixAt(meshIndex, mat4);
+  }
+
+  function rebuildRemoteAttaches(r: Remote): void {
+    for (const id of PROP_IDS) {
+      const mesh = r.attachMeshes[id];
+      mesh.count = 0;
+      for (let k = 0; k < MAX_REMOTE_ATTACH; k++) mesh.setMatrixAt(k, HIDDEN);
+    }
+
+    const start = Math.max(0, r.attachList.length - MAX_REMOTE_ATTACH);
+    const perPropIdx = Object.fromEntries(PROP_IDS.map((id) => [id, 0])) as Record<
+      PropId,
+      number
+    >;
+
+    for (let i = start; i < r.attachList.length; i++) {
+      const a = r.attachList[i]!;
+      const mesh = r.attachMeshes[a.propId];
+      const idx = perPropIdx[a.propId]++;
+      layoutRemoteAttach(a, idx, mesh);
+      mesh.count = idx + 1;
+    }
+
+    for (const id of PROP_IDS) {
+      r.attachMeshes[id].instanceMatrix.needsUpdate = true;
+    }
   }
 
   function upsertRemote(p: {
@@ -407,36 +673,28 @@ async function main() {
     r.radius = p.radius;
   }
 
-  /** Place a single remote attachment instance on the sphere surface. */
-  function layoutRemoteAttach(r: Remote, idx: number): void {
-    const a = r.attach[idx];
-    if (!a) return;
-    const [x, y, z] = surfaceAttachPosition(
-      [a.normal.x, a.normal.y, a.normal.z],
-      r.radius,
-      a.size / 2,
-      ATTACH_SINK_RATIO,
-    );
-    scratchQuat.setFromUnitVectors(up, a.normal);
-    mat4.compose(scratchPos.set(x, y, z), scratchQuat, scratchScale.set(a.size, a.size, a.size));
-    r.attachMesh.setMatrixAt(idx, mat4);
-    r.attachMesh.setColorAt(idx, tierColors[a.tier]);
-  }
-
-  /** Attribute a picked map object to the remote player who grabbed it. */
   function addRemoteAttachment(playerId: string, objectId: number): void {
     const obj = freeObjs[objectId];
     if (!obj) return;
     const r = remotes.get(playerId) ?? createRemote(playerId, [obj.px, obj.py, obj.pz]);
 
-    const idx = r.attachTotal % MAX_REMOTE_ATTACH; // ring buffer
-    r.attachTotal++;
     const [nx, ny, nz] = seededUnitVector(objectId);
-    r.attach[idx] = { tier: obj.tier, size: obj.size, normal: new THREE.Vector3(nx, ny, nz) };
-    r.attachMesh.count = Math.min(r.attachTotal, MAX_REMOTE_ATTACH);
-    layoutRemoteAttach(r, idx);
-    r.attachMesh.instanceMatrix.needsUpdate = true;
-    if (r.attachMesh.instanceColor) r.attachMesh.instanceColor.needsUpdate = true;
+    const normal = new THREE.Vector3(nx, ny, nz);
+    const [lx, ly, lz] = tieredSurfaceAttachPosition(
+      [nx, ny, nz],
+      VISUAL_CORE_RADIUS,
+      r.radius,
+      obj.tierIndex,
+      obj.size,
+      ATTACH_SINK_RATIO,
+    );
+    r.attachList.push({
+      propId: obj.propId,
+      size: obj.size,
+      normal,
+      localPos: new THREE.Vector3(lx, ly, lz),
+    });
+    rebuildRemoteAttaches(r);
   }
 
   function removeRemote(id: string): void {
@@ -444,8 +702,9 @@ async function main() {
     if (!r) return;
     scene.remove(r.group);
     (r.core.material as THREE.Material).dispose();
-    (r.attachMesh.material as THREE.Material).dispose();
-    r.attachMesh.dispose();
+    for (const id of PROP_IDS) {
+      r.attachMeshes[id].dispose();
+    }
     remotes.delete(id);
   }
 
@@ -468,7 +727,8 @@ async function main() {
     switch (msg.t) {
       case "welcome":
         net.playerId = msg.playerId;
-        // Teleport to server-assigned spawn so players do not overlap.
+        respawnX = msg.spawn[0];
+        respawnZ = msg.spawn[2];
         ballBody.setTranslation(
           { x: msg.spawn[0], y: msg.spawn[1], z: msg.spawn[2] },
           true,
@@ -485,7 +745,6 @@ async function main() {
             seen.add(p.id);
           }
         }
-        // Drop remotes that left or are no longer in the room.
         for (const id of remotes.keys()) {
           if (!seen.has(id)) removeRemote(id);
         }
@@ -493,7 +752,6 @@ async function main() {
       }
       case "pickup":
         removeMapObjectById(msg.objectId);
-        // Attribute the object to the remote who grabbed it (empty id = late-join sync).
         if (msg.playerId && msg.playerId !== net.playerId) {
           addRemoteAttachment(msg.playerId, msg.objectId);
         }
@@ -511,16 +769,19 @@ async function main() {
   function removeMapObject(obj: FreeObj, fromNetwork = false): void {
     if (obj.picked) return;
     obj.picked = true;
-    obj.active = false;
+    obj.visual = false;
+    obj.physics = false;
+    obj.fade = 0;
 
-    freeMesh[obj.tier].setMatrixAt(obj.index, HIDDEN);
-    freeMesh[obj.tier].instanceMatrix.needsUpdate = true;
+    freeMesh[obj.propId].setMatrixAt(obj.index, HIDDEN);
+    freeMesh[obj.propId].instanceMatrix.needsUpdate = true;
 
     if (obj.collider) {
       freeByCollider.delete(obj.collider.handle);
       world.removeCollider(obj.collider, false);
       obj.collider = null;
     }
+    colliderDebug?.removeProp(obj.id);
 
     if (!fromNetwork && net.isOnline) {
       net.send({ t: "pickupReport", objectId: obj.id });
@@ -533,42 +794,153 @@ async function main() {
   }
 
   function isKatamariCollider(handle: number): boolean {
-    return handle === ballCollider.handle || sensorHandles.has(handle);
+    if (handle === ballCollider.handle || handle === pickupSensor.handle) return true;
+    for (const c of attachColliders) {
+      if (c.handle === handle) return true;
+    }
+    return false;
   }
 
-  function placeAttachment(a: Attached): { x: number; y: number; z: number } {
-    const [x, y, z] = surfaceAttachPosition(
-      [a.normal.x, a.normal.y, a.normal.z],
-      colliderRadius,
-      a.size / 2,
-      ATTACH_SINK_RATIO,
-    );
-    mat4.compose(scratchPos.set(x, y, z), a.rot, scratchScale.set(a.size, a.size, a.size));
-    attachMesh[a.tier].setMatrixAt(a.index, mat4);
-    return { x, y, z };
+  function attachmentProtrusion(a: Attached): number {
+    return Math.hypot(a.localPos.x, a.localPos.y, a.localPos.z) + a.size / 2;
   }
 
-  /** Rebuild rolling collider + reposition all attachments after growth. */
-  function rebuildKatamari(): void {
-    colliderRadius = katamariRadius;
+  function visualClumpRadius(): number {
+    let maxR = VISUAL_CORE_RADIUS;
+    for (const a of attachedList) {
+      maxR = Math.max(maxR, attachmentProtrusion(a));
+    }
+    return maxR;
+  }
+
+  function placeAttachment(a: Attached): void {
+    mat4.compose(a.localPos, a.rot, scratchScale.set(a.size, a.size, a.size));
+    attachMesh[a.propId].setMatrixAt(a.index, mat4);
+  }
+
+  function syncPickupSensor(next: number): void {
+    if (Math.abs(next - activePickupSensorRadius) < 1e-5) return;
+    activePickupSensorRadius = next;
+    world.removeCollider(pickupSensor, false);
+    pickupSensor = makePickupSensor(activePickupSensorRadius);
+  }
+
+  function syncColliderRadius(next: number): void {
+    if (Math.abs(next - colliderRadius) < 1e-5) return;
+    const prev = colliderRadius;
+    colliderRadius = next;
     world.removeCollider(ballCollider, false);
     ballCollider = makeKatamariCollider(colliderRadius);
-    ballMesh.scale.setScalar(colliderRadius);
+    ballBody.setSoftCcdPrediction(colliderRadius * SOFT_CCD_RADIUS_FACTOR);
 
     const t = ballBody.translation();
-    ballBody.setTranslation({ x: t.x, y: colliderRadius, z: t.z }, true);
-
-    const touched = new Set<number>();
-    for (const a of attachedList) {
-      const p = placeAttachment(a);
-      a.sensor?.setTranslation({ x: p.x, y: p.y, z: p.z });
-      touched.add(a.tier);
+    let y = t.y;
+    if (next > prev && isBallGrounded()) {
+      y += next - prev;
     }
-    touched.forEach((ti) => (attachMesh[ti].instanceMatrix.needsUpdate = true));
+    ballBody.setTranslation({ x: t.x, y, z: t.z }, true);
   }
 
-  function maybeRebuildKatamari(): void {
-    if (katamariRadius >= colliderRadius * 1.02) rebuildKatamari();
+  function syncAttachColliders(): void {
+    for (const c of attachColliders) {
+      world.removeCollider(c, false);
+    }
+    attachColliders.length = 0;
+
+    const colliding = [...attachedList]
+      .sort((a, b) => attachmentProtrusion(b) - attachmentProtrusion(a))
+      .slice(0, ATTACH_PHYSICS_COUNT);
+    for (const a of colliding) {
+      const def = getPropDef(a.propId);
+      const [hx, hy, hz] = worldColliderHalf(def.colliderHalf, a.size);
+      const c = world.createCollider(
+        RAPIER.ColliderDesc.cuboid(hx, hy, hz)
+          .setTranslation(a.localPos.x, a.localPos.y, a.localPos.z)
+          .setRotation({ x: a.rot.x, y: a.rot.y, z: a.rot.z, w: a.rot.w })
+          .setFriction(GROUND_FRICTION)
+          .setRestitution(0.02)
+          .setDensity(0)
+          .setCollisionGroups(PHYS_GROUPS.katamari)
+          .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS),
+        ballBody,
+      );
+      attachColliders.push(c);
+    }
+  }
+
+  function isBallGrounded(): boolean {
+    const p = ballBody.translation();
+    const ray = new RAPIER.Ray({ x: p.x, y: p.y, z: p.z }, { x: 0, y: -1, z: 0 });
+    const hit = world.castRay(
+      ray,
+      colliderRadius + GROUND_PROBE_MARGIN,
+      true,
+      undefined,
+      undefined,
+      ballCollider,
+      ballBody,
+    );
+    return hit !== null;
+  }
+
+  function settleGroundContact(): void {
+    if (!isBallGrounded()) return;
+    const lv = ballBody.linvel();
+    if (lv.y < 0) {
+      ballBody.setLinvel({ x: lv.x, y: 0, z: lv.z }, true);
+    }
+  }
+
+  const FLOOR_RECOVER_RAY_Y = 48;
+
+  /** Safety net when discrete physics misses the ground collider. */
+  function recoverGroundTunnel(): void {
+    const p = ballBody.translation();
+    const minCenterY = colliderRadius;
+    if (p.y >= minCenterY - 0.2) return;
+
+    const ray = new RAPIER.Ray(
+      { x: p.x, y: FLOOR_RECOVER_RAY_Y, z: p.z },
+      { x: 0, y: -1, z: 0 },
+    );
+    const hit = world.castRay(
+      ray,
+      FLOOR_RECOVER_RAY_Y + 20,
+      true,
+      undefined,
+      undefined,
+      ballCollider,
+      ballBody,
+    );
+
+    let targetY = minCenterY;
+    if (hit) {
+      const surfaceY = FLOOR_RECOVER_RAY_Y - hit.timeOfImpact;
+      targetY = Math.max(minCenterY, surfaceY + colliderRadius);
+    }
+
+    ballBody.setTranslation({ x: p.x, y: targetY, z: p.z }, true);
+    const lv = ballBody.linvel();
+    if (lv.y < 0) {
+      ballBody.setLinvel({ x: lv.x, y: 0, z: lv.z }, true);
+    }
+  }
+
+  /** Return to spawn when physics bugs push the ball outside the playable map. */
+  function recoverOutOfBounds(): void {
+    const p = ballBody.translation();
+    const horizLimit = MAP_GROUND_SIZE / 2 - MAP_PLAY_MARGIN;
+    const outside =
+      Math.abs(p.x) > horizLimit ||
+      Math.abs(p.z) > horizLimit ||
+      p.y < MAP_RECOVER_MIN_Y ||
+      p.y > MAP_RECOVER_MAX_Y;
+    if (!outside) return;
+
+    ballBody.setTranslation({ x: respawnX, y: colliderRadius, z: respawnZ }, true);
+    ballBody.setLinvel({ x: 0, y: 0, z: 0 }, true);
+    ballBody.setAngvel({ x: 0, y: 0, z: 0 }, true);
+    console.warn("[recover] ball returned to spawn (out of bounds)");
   }
 
   function contactNormal(
@@ -600,61 +972,115 @@ async function main() {
     return worldNormal.clone();
   }
 
+  function canPickupNow(free: FreeObj): boolean {
+    return canPickup(free.size, pickupClumpRadius());
+  }
+
+  function syncPropCollisionGroups(obj: FreeObj, force = false): void {
+    if (!obj.collider || obj.picked) return;
+    const pickable = canPickupNow(obj);
+    if (!force && obj.pickableFilter === pickable) return;
+    obj.pickableFilter = pickable;
+    obj.collider.setCollisionGroups(
+      pickable ? PHYS_GROUPS.pickupProp : PHYS_GROUPS.blockProp,
+    );
+  }
+
+  function syncAllActivePropCollisionGroups(): void {
+    for (const obj of freeObjs) {
+      if (obj.physics && !obj.picked) syncPropCollisionGroups(obj, true);
+    }
+  }
+
+  function tryPickupOverlaps(): void {
+    const bp = ballBody.translation();
+    const shape = new RAPIER.Ball(pickupSensorReach());
+    const pending = new Set<FreeObj>();
+
+    world.intersectionsWithShape(
+      { x: bp.x, y: bp.y, z: bp.z },
+      ballBody.rotation(),
+      shape,
+      (collider) => {
+        const free = freeByCollider.get(collider.handle);
+        if (free && !free.picked && canPickupNow(free)) pending.add(free);
+        return true;
+      },
+      undefined,
+      PHYS_GROUPS.pickupSensor,
+      pickupSensor,
+      ballBody,
+    );
+
+    for (const free of pending) {
+      if (free.picked) continue;
+      const radial = radialOutwardNormal(
+        [bp.x, bp.y, bp.z],
+        [free.px, free.py, free.pz],
+      );
+      if (!radial) continue;
+      worldNormal.set(radial[0], radial[1], radial[2]);
+      attachPickup(free, worldNormal);
+    }
+  }
+
   function attachPickup(free: FreeObj, normalWorld: THREE.Vector3): void {
     if (free.picked) return;
-    if (!canPickup(free.size, katamariRadius)) return;
+    if (!canPickupNow(free)) return;
 
-    removeMapObject(free, false);
-    attachedCount++;
-
-    // local normal + orientation (sit flat on the contacted face, random twist)
+    const bp = ballBody.translation();
     const r = ballBody.rotation();
     ballQuat.set(r.x, r.y, r.z, r.w);
     invBallQuat.copy(ballQuat).invert();
-    localNormal.copy(normalWorld).applyQuaternion(invBallQuat).normalize();
+
+    if (normalWorld.lengthSq() > 1e-6) {
+      localNormal.copy(normalWorld).applyQuaternion(invBallQuat).normalize();
+    } else {
+      const radial = radialOutwardNormal(
+        [bp.x, bp.y, bp.z],
+        [free.px, free.py, free.pz],
+      );
+      if (!radial) return;
+      localNormal.set(radial[0], radial[1], radial[2]).applyQuaternion(invBallQuat).normalize();
+    }
     const rot = new THREE.Quaternion().setFromUnitVectors(up, localNormal);
     rot.premultiply(
       scratchQuat.setFromAxisAngle(localNormal, Math.random() * Math.PI * 2),
     );
 
-    const ti = free.tier;
-    const index = attachMesh[ti].count;
-    attachMesh[ti].count = index + 1;
-    const a: Attached = { tier: ti, index, size: free.size, normal: localNormal.clone(), rot };
-    attachedList.push(a);
-    placeAttachment(a);
-    attachMesh[ti].instanceMatrix.needsUpdate = true;
+    removeMapObject(free, false);
+    attachedCount++;
 
-    // capped sensor so protruding faces stay "sticky" near the player
-    const p = surfaceAttachPosition(
+    const [lx, ly, lz] = tieredSurfaceAttachPosition(
       [localNormal.x, localNormal.y, localNormal.z],
-      colliderRadius,
-      free.size / 2,
+      VISUAL_CORE_RADIUS,
+      pickupClumpRadius(),
+      free.tierIndex,
+      free.size,
       ATTACH_SINK_RATIO,
     );
-    const half = free.size / 2;
-    const sensor = world.createCollider(
-      RAPIER.ColliderDesc.cuboid(half, half, half)
-        .setTranslation(p[0], p[1], p[2])
-        .setRotation({ x: rot.x, y: rot.y, z: rot.z, w: rot.w })
-        .setSensor(true)
-        .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS),
-      ballBody,
-    );
-    a.sensor = sensor;
-    sensorHandles.add(sensor.handle);
-    sensorQueue.push(a);
-    if (sensorQueue.length > MAX_SENSORS) {
-      const old = sensorQueue.shift();
-      if (old?.sensor) {
-        sensorHandles.delete(old.sensor.handle);
-        world.removeCollider(old.sensor, false);
-        old.sensor = undefined;
-      }
-    }
+    const localPos = new THREE.Vector3(lx, ly, lz);
 
-    katamariRadius = growKatamariRadius(katamariRadius, free.size);
-    maybeRebuildKatamari();
+    const propId = free.propId;
+    const index = attachMesh[propId].count;
+    attachMesh[propId].count = index + 1;
+    const a: Attached = {
+      propId,
+      index,
+      size: free.size,
+      normal: localNormal.clone(),
+      rot,
+      localPos,
+    };
+    attachedList.push(a);
+    placeAttachment(a);
+    attachMesh[propId].instanceMatrix.needsUpdate = true;
+
+    pickupGrowthRadius = growPickupRadius(pickupGrowthRadius, free.size);
+    syncPickupSensor(pickupSensorReach());
+    syncColliderRadius(physicsColliderRadius(visualClumpRadius()));
+    syncAttachColliders();
+    syncAllActivePropCollisionGroups();
   }
 
   function handleCollisions(): void {
@@ -675,7 +1101,7 @@ async function main() {
 
       const free = freeByCollider.get(otherHandle);
       if (!free || free.picked) return;
-      if (!canPickup(free.size, katamariRadius)) return;
+      if (!canPickupNow(free)) return;
 
       const katCollider = world.getCollider(katHandle);
       const normal = contactNormal(katCollider, free);
@@ -684,45 +1110,49 @@ async function main() {
   }
 
   function updateHud(): void {
-    const diameter = katamariRadius * 2;
-    sizeLabel.textContent = diameter.toFixed(2);
+    const clumpR = pickupClumpRadius();
+    sizeLabel.textContent = (clumpR * 2).toFixed(2);
     countLabel.textContent = String(attachedCount);
-
-    const next = nextLockedTier(katamariRadius);
-    if (next) {
-      const need = minDiameterForPickup(next.size);
-      const remain = Math.max(0, need - diameter);
-      nextLabel.textContent = `${next.name} (${need.toFixed(2)}m) · ${remain.toFixed(2)}m 남음`;
-    } else {
-      nextLabel.textContent = "모든 단계 해금";
-    }
+    nextLabel.textContent = growthHudText(clumpR);
 
     if (netLabel && net.isOnline) {
       netLabel.textContent = `온라인 · ${remotes.size}명`;
     }
   }
 
-  // --- resize --------------------------------------------------------------
   window.addEventListener("resize", () => {
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight);
   });
 
-  // --- loop ----------------------------------------------------------------
   let accumulator = 0;
   let last = performance.now();
+  let cameraFrameRadius = VISUAL_CORE_RADIUS;
 
   function applyMovement(): void {
     const [mx, my] = input.move;
     const lv = ballBody.linvel();
+    const grounded = isBallGrounded();
 
-    // Constant-speed, direction-independent control: set velocity directly so
-    // there is no acceleration, instant stop on release, instant reverse.
-    const vel = computeMoveVelocity({ move: [mx, my], yaw: input.yaw }, lv.y);
-    ballBody.setLinvel(vel, true);
-    // Angular velocity only drives the visual roll (cosmetic).
-    ballBody.setAngvel(computeRollAngvel(vel.x, vel.z, colliderRadius), true);
+    if (grounded) {
+      const vel = computeMoveVelocity({ move: [mx, my], yaw: input.yaw }, lv.y);
+      ballBody.setLinvel(vel, true);
+      ballBody.setAngvel(computeRollAngvel(vel.x, vel.z, colliderRadius), true);
+      return;
+    }
+
+    const dir = computeMoveDir({ move: [mx, my], yaw: input.yaw });
+    const steer = AIR_CONTROL * MOVE_SPEED;
+    ballBody.setLinvel(
+      {
+        x: lv.x + dir.x * steer * FIXED_DT,
+        y: lv.y,
+        z: lv.z + dir.z * steer * FIXED_DT,
+      },
+      true,
+    );
+    ballBody.setAngvel(computeRollAngvel(lv.x, lv.z, colliderRadius), true);
   }
 
   function frame(now: number) {
@@ -732,37 +1162,59 @@ async function main() {
 
     while (accumulator >= FIXED_DT) {
       applyMovement();
-      world.timestep = FIXED_DT;
-      world.step(eventQueue);
+      const subDt = FIXED_DT / PHYSICS_SUBSTEPS;
+      for (let s = 0; s < PHYSICS_SUBSTEPS; s++) {
+        world.timestep = subDt;
+        world.step(eventQueue);
+      }
+      settleGroundContact();
+      recoverGroundTunnel();
+      recoverOutOfBounds();
       handleCollisions();
+      tryPickupOverlaps();
       accumulator -= FIXED_DT;
     }
 
-    // stream in/out map chunks around the player (cheap: early-outs per cell)
     const bp = ballBody.translation();
     updateStreaming(bp.x, bp.z);
+    tickPickupFades(frameDt);
 
     const yaw = input.yaw;
     const forward = new THREE.Vector3(Math.sin(yaw), 0, Math.cos(yaw));
 
-    // sync ball root from physics
     const t = ballBody.translation();
     const rot = ballBody.rotation();
     ballRoot.position.set(t.x, t.y, t.z);
     ballQuat.set(rot.x, rot.y, rot.z, rot.w);
     ballRoot.quaternion.copy(ballQuat);
+    colliderDebug?.syncBall(t.x, t.y, t.z, colliderRadius, ballQuat);
 
-    // shadow frustum follows the player for crisp, cheap shadows
-    sun.position.set(t.x + 20, t.y + 40, t.z + 20);
+    sun.position.set(t.x + 28, t.y + 52, t.z + 22);
     sun.target.position.set(t.x, t.y, t.z);
+    fill.position.set(t.x - 24, t.y + 28, t.z - 18);
 
-    // camera follows behind based on yaw, distance scales with size
-    const dist = 6 + katamariRadius * 4;
-    const height = 3 + katamariRadius * 2.5;
+    const targetFrameR = cameraFramingRadius(
+      visualClumpRadius(),
+      VISUAL_CORE_RADIUS,
+      CAMERA_RADIUS_GROWTH_BLEND,
+      CAMERA_MAX_FRAME_RADIUS,
+    );
+    cameraFrameRadius = smoothCameraFramingRadius(
+      cameraFrameRadius,
+      targetFrameR,
+      frameDt,
+      CAMERA_RADIUS_SMOOTH_SPEED,
+      CAMERA_RADIUS_MAX_GROW_PER_SEC,
+    );
+    const { dist, height } = cameraFollowOffset(
+      cameraFrameRadius,
+      CAMERA_FOV,
+      CAMERA_BALL_SCREEN_FRACTION,
+      CAMERA_HEIGHT_RATIO,
+    );
     camera.position.set(t.x - forward.x * dist, t.y + height, t.z - forward.z * dist);
     camera.lookAt(t.x, t.y, t.z);
 
-    // report own state to the relay server (~20Hz)
     stateAccum += frameDt;
     if (net.isOnline && stateAccum >= 0.05) {
       stateAccum = 0;
@@ -771,25 +1223,16 @@ async function main() {
         seq: stateSeq++,
         pos: [t.x, t.y, t.z],
         rot: [rot.x, rot.y, rot.z, rot.w],
-        radius: katamariRadius,
+        radius: pickupClumpRadius(),
         score: attachedCount,
       });
     }
 
-    // interpolate remote players toward their latest snapshot
     const lerpA = 1 - Math.exp(-frameDt * 12);
     for (const r of remotes.values()) {
       r.group.position.lerp(r.targetPos, lerpA);
       r.group.quaternion.slerp(r.targetQuat, lerpA);
-      r.core.scale.setScalar(r.radius);
-      // Re-layout attachments only when the ball grew meaningfully (2%),
-      // mirroring the local rebuild throttle.
-      if (r.attachMesh.count > 0 && r.radius >= r.layoutRadius * 1.02) {
-        r.layoutRadius = r.radius;
-        for (let i = 0; i < r.attachMesh.count; i++) layoutRemoteAttach(r, i);
-        r.attachMesh.instanceMatrix.needsUpdate = true;
-        if (r.attachMesh.instanceColor) r.attachMesh.instanceColor.needsUpdate = true;
-      }
+      r.core.scale.setScalar(VISUAL_CORE_RADIUS);
     }
 
     updateHud();

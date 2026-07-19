@@ -9,7 +9,8 @@
     "dev:client": "pnpm --filter @growroll/client dev",
     "dev:server": "pnpm --filter @growroll/server dev",
     "build": "pnpm -r build",
-    "typecheck": "pnpm -r typecheck"
+    "typecheck": "pnpm -r typecheck",
+    "analyze-props": "pnpm --filter @growroll/client analyze-props"
   },
   "devDependencies": {
     "concurrently": "^9.1.2",

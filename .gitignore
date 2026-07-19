@@ -26,3 +26,6 @@ Thumbs.db
 
 # vercel
 .vercel
+
+# optional: keep .gltf out of git if exported separately
+# packages/client/public/models/*.gltf

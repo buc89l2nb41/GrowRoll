@@ -1,57 +1,84 @@
 import {
-  GROWTH_VOLUME_SCALE,
   PICKUP_RATIO,
-  radiusFromVolume,
+  START_RADIUS,
+  COLLIDER_GROWTH_BLEND,
+  MAX_COLLIDER_RADIUS,
+  PICKUP_GROWTH_VOLUME_SCALE,
   volumeFromRadius,
+  radiusFromVolume,
 } from "./constants.js";
+import { MAP_SPAWN_SIZES, MODELING_TIER_COUNT } from "./props.js";
+import { modelingTierIndexForClump } from "./tier.js";
 
-/** Object tiers on the map (size = box edge length in meters). */
-export const OBJECT_TIERS = [
-  { name: "초록", size: 0.3, color: 0x7ee787 },
-  { name: "노랑", size: 0.6, color: 0xf2cc60 },
-  { name: "파랑", size: 1.0, color: 0xa5d6ff },
-  { name: "분홍", size: 1.6, color: 0xff9bce },
-] as const;
+/** Starting ball diameter — modeling tier sizes are expressed relative to this. */
+export const START_DIAMETER = START_RADIUS * 2;
 
-/** Volume added to the katamari when an object is picked up. */
-export function pickupVolumeContribution(objectSize: number): number {
-  // Use box volume (size³) with a scale boost so small pickups feel meaningful.
-  return objectSize ** 3 * GROWTH_VOLUME_SCALE;
+export function katamariDiameter(clumpRadius: number): number {
+  return clumpRadius * 2;
 }
 
-/** New katamari radius after absorbing an object (whole clump grows). */
-export function growKatamariRadius(currentRadius: number, objectSize: number): number {
-  const newVol =
-    volumeFromRadius(currentRadius) + pickupVolumeContribution(objectSize);
-  return radiusFromVolume(newVol);
-}
-
-export function canPickup(objectSize: number, katamariRadius: number): boolean {
-  return objectSize <= katamariRadius * PICKUP_RATIO;
-}
-
-/** Minimum katamari radius required to pick up an object of the given size. */
-export function minRadiusForPickup(objectSize: number): number {
-  return objectSize / PICKUP_RATIO;
+/** True when the object fits on the katamari (modeling: smaller than the ball). */
+export function canPickup(objectSize: number, clumpRadius: number): boolean {
+  return objectSize <= katamariDiameter(clumpRadius) * PICKUP_RATIO;
 }
 
 export function minDiameterForPickup(objectSize: number): number {
-  return minRadiusForPickup(objectSize) * 2;
+  return objectSize / PICKUP_RATIO;
 }
 
-/** Next object tier that is not yet pickable, or null if all tiers unlocked. */
-export function nextLockedTier(katamariRadius: number): (typeof OBJECT_TIERS)[number] | null {
-  for (const tier of OBJECT_TIERS) {
-    if (!canPickup(tier.size, katamariRadius)) return tier;
+export function minRadiusForPickup(objectSize: number): number {
+  return minDiameterForPickup(objectSize) / 2;
+}
+
+/** Physics sphere — tracks visible clump size (client passes visualClumpRadius). */
+export function physicsColliderRadius(visualRadius: number): number {
+  const extra = Math.max(0, visualRadius - START_RADIUS);
+  const grown = START_RADIUS + extra * COLLIDER_GROWTH_BLEND;
+  return Math.min(Math.max(START_RADIUS, grown), MAX_COLLIDER_RADIUS);
+}
+
+/** Hidden pickup growth — many small objects still raise the next-tier threshold. */
+export function growPickupRadius(currentRadius: number, objectSize: number): number {
+  const added = objectSize ** 3 * PICKUP_GROWTH_VOLUME_SCALE;
+  return radiusFromVolume(volumeFromRadius(currentRadius) + added);
+}
+
+/** Pickup + HUD size: visual bounding sphere or accumulated growth, whichever is larger. */
+export function effectivePickupRadius(visualRadius: number, growthRadius: number): number {
+  return Math.max(visualRadius, growthRadius);
+}
+
+/** Modeling / tier progression — volume growth only (not visual shell protrusion). */
+export function modelingClumpRadius(growthRadius: number): number {
+  return growthRadius;
+}
+
+/** Sensor reach — must include attached props sticking out beyond the growth sphere. */
+export function computePickupSensorRadius(visualRadius: number, growthRadius: number): number {
+  return effectivePickupRadius(visualRadius, growthRadius);
+}
+
+/** Visible pickup diameter used for canPickup (modeling / player-facing). */
+export function pickupDiameter(clumpRadius: number): number {
+  return katamariDiameter(clumpRadius);
+}
+
+/** Next modeling tier size that requires a larger ball than `currentDiameter`. */
+export function nextModelingTierSize(currentDiameter: number): number | null {
+  for (const size of MAP_SPAWN_SIZES) {
+    if (size > currentDiameter + 1e-4) return size;
   }
   return null;
 }
 
-/** Diameter growth from one pickup of the given object size. */
-export function diameterGainFromPickup(
-  currentRadius: number,
-  objectSize: number,
-): number {
-  const next = growKatamariRadius(currentRadius, objectSize);
-  return (next - currentRadius) * 2;
+export function growthHudText(clumpRadius: number): string {
+  const currentTier = modelingTierIndexForClump(clumpRadius) + 1;
+  const d = katamariDiameter(clumpRadius);
+  const next = nextModelingTierSize(d);
+  if (next === null) {
+    return `티어 ${currentTier}/${MODELING_TIER_COUNT} · Ø ${d.toFixed(2)}m`;
+  }
+  const nextIdx = MAP_SPAWN_SIZES.indexOf(next as (typeof MAP_SPAWN_SIZES)[number]);
+  const nextTierNum = nextIdx >= 0 ? nextIdx + 1 : currentTier + 1;
+  return `티어 ${currentTier}/${MODELING_TIER_COUNT} · 다음 ${nextTierNum} (Ø${next.toFixed(2)}m) · Ø${d.toFixed(2)}m`;
 }

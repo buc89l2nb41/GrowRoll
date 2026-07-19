@@ -1,5 +1,4 @@
 import { MOVE_SPEED } from "./constants.js";
-
 export interface RollInput {
   move: [number, number];
   yaw: number;
