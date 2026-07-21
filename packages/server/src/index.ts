@@ -57,6 +57,8 @@ wss.on("connection", (socket) => {
           socket.close(1013, "room full");
           return;
         }
+        // Empty room = new session (covers missed reset on disconnect / stale Docker).
+        if (room.playerCount === 0) room.resetWorld();
         client.joined = true;
         const spawn = room.addPlayer(id, msg.name?.slice(0, 24) || "Player");
         send(socket, {
