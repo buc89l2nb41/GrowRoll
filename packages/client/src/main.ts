@@ -729,6 +729,8 @@ async function main() {
         net.playerId = msg.playerId;
         respawnX = msg.spawn[0];
         respawnZ = msg.spawn[2];
+        // Sync map with server session (cleared picks after empty room, etc.).
+        respawnAllMapObjects();
         ballBody.setTranslation(
           { x: msg.spawn[0], y: msg.spawn[1], z: msg.spawn[2] },
           true,
@@ -786,6 +788,30 @@ async function main() {
     if (!fromNetwork && net.isOnline) {
       net.send({ t: "pickupReport", objectId: obj.id });
     }
+  }
+
+  /** Restore a picked map object (streaming re-enables visual/physics when in range). */
+  function respawnMapObject(obj: FreeObj): void {
+    if (!obj.picked) return;
+    obj.picked = false;
+    obj.pickableFilter = undefined;
+    obj.physics = false;
+    obj.visual = false;
+    obj.fade = 0;
+    if (obj.collider) {
+      freeByCollider.delete(obj.collider.handle);
+      world.removeCollider(obj.collider, false);
+      obj.collider = null;
+    }
+    colliderDebug?.removeProp(obj.id);
+    freeMesh[obj.propId].setMatrixAt(obj.index, HIDDEN);
+    dirtyFreeProps.add(obj.propId);
+  }
+
+  function respawnAllMapObjects(): void {
+    for (const obj of freeObjs) respawnMapObject(obj);
+    streamCellX = NaN;
+    streamCellZ = NaN;
   }
 
   function removeMapObjectById(objectId: number): void {

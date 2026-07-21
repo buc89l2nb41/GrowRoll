@@ -62,7 +62,9 @@ export class Room {
 
   /** Phase 2: reset shared map state when the room empties (per-player respawn later). */
   resetWorld(): void {
+    const n = this.pickedObjects.size;
     this.pickedObjects.clear();
+    if (n > 0) console.log(`[reset] room empty — cleared ${n} picked object(s)`);
   }
 
   setState(id: EntityId, pos: Vec3, rot: Quat, radius: number, score: number): void {
