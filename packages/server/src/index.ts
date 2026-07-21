@@ -101,6 +101,7 @@ wss.on("connection", (socket) => {
     if (client?.joined) {
       room.removePlayer(id);
       broadcast({ t: "playerLeft", playerId: id });
+      if (room.playerCount === 0) room.resetWorld();
       console.log(`[leave] ${id} (${room.playerCount} players)`);
     }
   });
