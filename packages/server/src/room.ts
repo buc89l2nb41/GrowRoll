@@ -19,6 +19,8 @@ export class Room {
   private players = new Map<EntityId, PlayerState>();
   /** Map objects already picked (by stable object index). */
   readonly pickedObjects = new Set<number>();
+  /** Who picked each object, so late joiners can draw it on that ball. */
+  private pickedBy = new Map<number, EntityId>();
 
   constructor(id: string) {
     this.id = id;
@@ -64,7 +66,21 @@ export class Room {
   resetWorld(): void {
     const n = this.pickedObjects.size;
     this.pickedObjects.clear();
+    this.pickedBy.clear();
     if (n > 0) console.log(`[reset] room empty — cleared ${n} picked object(s)`);
+  }
+
+  hasPlayer(id: EntityId): boolean {
+    return this.players.has(id);
+  }
+
+  /** objectId → player still in the room, if any. */
+  pickedAttachments(): [number, EntityId][] {
+    const out: [number, EntityId][] = [];
+    for (const [objectId, playerId] of this.pickedBy) {
+      if (this.players.has(playerId)) out.push([objectId, playerId]);
+    }
+    return out;
   }
 
   setState(id: EntityId, pos: Vec3, rot: Quat, radius: number, score: number): void {
@@ -76,9 +92,10 @@ export class Room {
     p.score = score;
   }
 
-  reportPickup(objectId: number): boolean {
+  reportPickup(objectId: number, playerId: EntityId): boolean {
     if (this.pickedObjects.has(objectId)) return false;
     this.pickedObjects.add(objectId);
+    this.pickedBy.set(objectId, playerId);
     return true;
   }
 

@@ -69,8 +69,13 @@ wss.on("connection", (socket) => {
           tickRate: TICK_RATE,
           spawn,
         });
-        // Tell the joiner about objects already picked in this room.
+        // Map objects already gone. Include the owner so their ball shows those props.
+        const owned = new Set(room.pickedAttachments().map(([objectId]) => objectId));
+        for (const [objectId, playerId] of room.pickedAttachments()) {
+          send(socket, { t: "pickup", playerId, objectId, newRadius: 0 });
+        }
         for (const objectId of room.pickedObjects) {
+          if (owned.has(objectId)) continue;
           send(socket, { t: "pickup", playerId: "", objectId, newRadius: 0 });
         }
         console.log(`[join] ${id} (${room.playerCount} players)`);
@@ -82,7 +87,7 @@ wss.on("connection", (socket) => {
         }
         break;
       case "pickupReport":
-        if (client.joined && room.reportPickup(msg.objectId)) {
+        if (client.joined && room.reportPickup(msg.objectId, id)) {
           broadcastAll({
             t: "pickup",
             playerId: id,
