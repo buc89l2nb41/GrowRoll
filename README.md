@@ -1,6 +1,28 @@
 # GrowRoll
 
-온라인 멀티플레이 "굴려라 괴혼(Katamari)" 스타일 롤링 게임.
+**무엇:** 정원 소품을 굴려 붙이며 공을 키우는 브라우저 3D 롤링 게임입니다 (Three.js + Rapier, 멀티플레이 릴레이 서버 포함).
+
+**왜:** 직접 만든 에셋 도구(PromptAssetForge, LowPolyCultivar)로 만든 소품을 실제 게임에 넣어, 도구의 결과물이 게임 안에서 그대로 돌아가는지 보여 줍니다.
+
+**해보기:** [라이브 데모](https://grow-roll-client.vercel.app) — 열면 바로 시작합니다. `WASD`/방향키로 굴리고, 마우스 드래그로 카메라를 돌립니다.
+
+## 소품을 만든 도구
+
+게임에 나오는 GLB 39개(`packages/client/public/models/`)는 아래 두 도구를 거쳐 들어왔습니다.
+
+- **[PromptAssetForge](https://github.com/buc89l2nb41/PromptAssetForge)** — 테마 → 프롬프트 → 2D 이미지 → Trellis 2로 3D GLB를 만드는 로컬 도구입니다. [`docs/ART-PROMPTS-GARDEN.md`](docs/ART-PROMPTS-GARDEN.md)의 정원 프롬프트를 이 도구의 컬렉션으로 가져와 39개 모델을 생성했습니다.
+- **[LowPolyCultivar](https://github.com/buc89l2nb41/LowPolyCultivar)** — gltfpack 프리셋으로 GLB를 줄이고 원본과 비교하는 도구입니다. 이 게임의 도토리 모델로 LOD·텍스처 설정을 시험한 기록이 이 도구의 `gltfpack-lod.md`에 있습니다.
+
+| | 생성 직후 (39개 합계) | 게임에 들어간 파일 (39개 합계) |
+|---|---|---|
+| 삼각형 수 | 460,865 | 99,577 |
+| 파일 크기 | 88,705,204 B (약 88.7 MB) | 1,747,768 B (약 1.7 MB) |
+
+게임 쪽 파일은 모두 gltfpack 1.2 출력(meshopt 압축 + WebP 텍스처)이며, 클라이언트에 meshopt 디코더가 들어 있습니다.
+
+**한계:** 멀티플레이는 별도 릴레이 서버가 떠 있을 때만 다른 플레이어가 보이고, 서버가 없으면 싱글플레이로 동작합니다. 위 표의 수치는 두 폴더의 GLB를 직접 세어 낸 값입니다(생성 직후 = PromptAssetForge 출력 폴더).
+
+## 개발 정보
 
 - **클라이언트**: Vite + TypeScript + Three.js + Rapier → Vercel 배포
 - **서버**: Node + TypeScript + ws (Phase 2 **릴레이**) → Oracle Cloud Always Free VM (Docker)
